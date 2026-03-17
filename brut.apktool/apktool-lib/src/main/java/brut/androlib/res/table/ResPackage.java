@@ -29,6 +29,13 @@ import java.util.Objects;
 import java.util.Set;
 
 public class ResPackage {
+    // Static map of resource hex IDs to original names collected from R$*.smali
+    private static Map<String, String> sLostResourceNames = new HashMap<>();
+
+    public static void setLostResourceNames(Map<String, String> names) {
+        sLostResourceNames = names != null ? names : new HashMap<>();
+    }
+
     private final ResPackageGroup mGroup;
     private final int mIndex;
     private final Map<Integer, ResTypeSpec> mTypeSpecs;
@@ -194,18 +201,31 @@ public class ResPackage {
         }
 
         ResTypeSpec typeSpec = getTypeSpec(typeId);
+        String typeName = typeSpec.getName();
+        String hexId = resId.toString(); // "0x7fXXYYYY"
+        String deobfuscateName = typeName + hexId.substring(6, 10);
+        boolean isDuplicate = mNameRegistry.contains(typeName + "/" + name);
 
-        // Some apps had their entry names obfuscated or collapsed to a single value in the key string pool.
-        // Enforce uniqueness by forcing a rename when that happens.
-        if (mNameRegistry.contains(typeSpec.getName() + "/" + name)) {
-            name = "";
+        // Deobfuscate resource names
+        if (isDuplicate) {
+            name = deobfuscateName;
+        } else if (getName().equals("android") || (name.length() > 3 && !name.startsWith("APKTOOL_DUMMY_"))) {
+            // Keep original name for android package and non-obfuscated names
+        } else {
+            // Try to recover original name from R$*.smali
+            String lostName = sLostResourceNames.get(hexId);
+            if (lostName != null && lostName.length() > 3) {
+                name = lostName;
+            } else {
+                name = deobfuscateName;
+            }
         }
 
         entrySpec = new ResEntrySpec(typeSpec, entryId, name);
         mEntrySpecs.put(resId, entrySpec);
 
         // Register the name to enforce uniqueness.
-        mNameRegistry.add(typeSpec.getName() + "/" + entrySpec.getName());
+        mNameRegistry.add(typeName + "/" + entrySpec.getName());
 
         return entrySpec;
     }

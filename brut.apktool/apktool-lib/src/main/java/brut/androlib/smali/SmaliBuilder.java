@@ -22,8 +22,13 @@ import brut.directory.FileDirectory;
 import brut.common.Log;
 import brut.util.OS;
 import com.android.tools.smali.dexlib2.Opcodes;
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
+import com.android.tools.smali.dexlib2.iface.DexFile;
+import com.android.tools.smali.dexlib2.rewriter.DexRewriter;
 import com.android.tools.smali.dexlib2.writer.builder.DexBuilder;
 import com.android.tools.smali.dexlib2.writer.io.FileDataStore;
+import com.android.tools.smali.dexlib2.writer.io.MemoryDataStore;
+import com.android.tools.smali.dexlib2.writer.pool.DexPool;
 import com.android.tools.smali.smali.smaliFlexLexer;
 import com.android.tools.smali.smali.smaliParser;
 import com.android.tools.smali.smali.smaliTreeWalker;
@@ -91,7 +96,14 @@ public class SmaliBuilder {
                 }
             }
 
-            dexBuilder.writeTo(new FileDataStore(dexFile));
+            // Reverse the obfuscated type renaming to restore original class names
+            Opcodes opcodes = mApiLevel > 0 ? Opcodes.forApi(mApiLevel) : Opcodes.getDefault();
+            MemoryDataStore memStore = new MemoryDataStore();
+            dexBuilder.writeTo(memStore);
+            DexBackedDexFile assembledDex = new DexBackedDexFile(opcodes, memStore.getData());
+            DexRewriter reverseRewriter = new DexRewriter(new ReverseTypeRewriterModule());
+            DexFile finalDex = reverseRewriter.getDexFileRewriter().rewrite(assembledDex);
+            DexPool.writeTo(new FileDataStore(dexFile), finalDex);
         } catch (DirectoryException | IOException | RuntimeException ex) {
             throw new AndrolibException("Could not smali folder: " + smaliDir.getName(), ex);
         }

@@ -24,14 +24,21 @@ import com.android.tools.smali.dexlib2.analysis.InlineMethodResolver;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedOdexFile;
 import com.android.tools.smali.dexlib2.dexbacked.ZipDexContainer;
+import com.android.tools.smali.dexlib2.iface.DexFile;
+import com.android.tools.smali.dexlib2.rewriter.DexRewriter;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class SmaliDecoder {
     private final ZipDexContainer mDexContainer;
@@ -141,10 +148,77 @@ public class SmaliDecoder {
                 ((DexBackedOdexFile) dexFile).getOdexVersion());
         }
 
+        // Rename obfuscated types to avoid case-insensitive filesystem collisions
+        DexRewriter rewriter = new DexRewriter(new ObfuscatedTypeRewriterModule());
+        DexFile rewrittenDex = rewriter.getDexFileRewriter().rewrite(dexFile);
+
         OS.mkdir(smaliDir);
-        Baksmali.disassembleDexFile(dexFile, smaliDir, jobs, options);
+        Baksmali.disassembleDexFile(rewrittenDex, smaliDir, jobs, options);
+
+        // Fix InnerClass annotation names to match renamed class names
+        try {
+            fixInnerClassAnnotations(smaliDir);
+        } catch (IOException ignored) {
+        }
 
         int apiLevel = dexFile.getOpcodes().api;
         mInferredApiLevel.updateAndGet(cur -> (cur == 0 || cur > apiLevel) ? apiLevel : cur);
+    }
+
+    private static final Pattern CLASS_PATTERN = Pattern.compile("^\\.class\\s+.*\\s+(L[^;]+;)", Pattern.MULTILINE);
+
+    private static void fixInnerClassAnnotations(File dir) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                fixInnerClassAnnotations(file);
+            } else if (file.getName().endsWith(".smali") && file.getName().contains("$")) {
+                fixInnerClassAnnotation(file);
+            }
+        }
+    }
+
+    private static void fixInnerClassAnnotation(File smaliFile) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+
+        String simpleName = null;
+        for (String line : lines) {
+            if (line.startsWith(".class ")) {
+                Matcher m = CLASS_PATTERN.matcher(line);
+                if (m.find()) {
+                    String desc = m.group(1);
+                    String inner = desc.substring(1, desc.length() - 1);
+                    int lastDollar = inner.lastIndexOf('$');
+                    if (lastDollar >= 0) {
+                        simpleName = inner.substring(lastDollar + 1);
+                    }
+                }
+                break;
+            }
+        }
+        if (simpleName == null) return;
+
+        boolean inInnerClassAnnotation = false;
+        boolean modified = false;
+
+        for (int i = 0; i < lines.size(); i++) {
+            String trimmed = lines.get(i).trim();
+            if (trimmed.equals(".annotation system Ldalvik/annotation/InnerClass;")) {
+                inInnerClassAnnotation = true;
+            } else if (trimmed.equals(".end annotation") && inInnerClassAnnotation) {
+                inInnerClassAnnotation = false;
+            } else if (inInnerClassAnnotation && trimmed.startsWith("name = \"")) {
+                String newLine = "    name = \"" + simpleName + "\"";
+                if (!lines.get(i).equals(newLine)) {
+                    lines.set(i, newLine);
+                    modified = true;
+                }
+            }
+        }
+
+        if (modified) {
+            Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
+        }
     }
 }

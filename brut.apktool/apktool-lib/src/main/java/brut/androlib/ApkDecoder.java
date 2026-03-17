@@ -28,6 +28,8 @@ import brut.directory.DirectoryException;
 import brut.directory.ExtFile;
 import brut.util.BackgroundWorker;
 import brut.util.OS;
+
+import java.util.Map;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.io.FilenameUtils;
 
@@ -82,6 +84,27 @@ public class ApkDecoder {
                      + (mWorker != null ? " with " + mConfig.getJobs() + " threads" : ""));
 
             decodeSources(outDir);
+
+            if (mWorker != null) {
+                mWorker.waitForFinish();
+                if (mFirstError.get() != null) {
+                    throw mFirstError.get();
+                }
+            }
+
+            // Collect original resource names from R$*.smali before decoding resources
+            try {
+                Map<String, String> lostNames = brut.androlib.smali.ResourceDeobfuscator.collectLostResourceNames(outDir);
+                brut.androlib.res.table.ResPackage.setLostResourceNames(lostNames);
+                Log.i(TAG, "Collected " + lostNames.size() + " original resource names from smali");
+            } catch (java.io.IOException ex) {
+                Log.w(TAG, "Failed to collect resource names: " + ex.getMessage());
+            }
+
+            if (mConfig.getJobs() > 1) {
+                mWorker = new BackgroundWorker(mConfig.getJobs() - 1);
+            }
+
             decodeResources(outDir);
             decodeManifest(outDir);
 
@@ -96,6 +119,7 @@ public class ApkDecoder {
             copyRawFiles(outDir);
             copyUnknownFiles(outDir);
             writeApkInfo(outDir);
+
         } finally {
             if (mWorker != null) {
                 mWorker.shutdownNow();
