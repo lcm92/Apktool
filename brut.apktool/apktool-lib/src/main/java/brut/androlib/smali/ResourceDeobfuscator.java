@@ -16,78 +16,79 @@
  */
 package brut.androlib.smali;
 
+import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
+import com.android.tools.smali.dexlib2.dexbacked.ZipDexContainer;
+import com.android.tools.smali.dexlib2.iface.ClassDef;
+import com.android.tools.smali.dexlib2.iface.Field;
+import com.android.tools.smali.dexlib2.iface.value.EncodedValue;
+import com.android.tools.smali.dexlib2.iface.value.IntEncodedValue;
+
 import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
 import java.util.*;
 
 /**
- * Collects original resource names from R$*.smali files.
- * These files contain static final fields mapping field names to resource hex IDs:
- *   .field public static final ic_launcher:I = 0x7f080001
- * This allows recovering original resource names that were obfuscated in resources.arsc.
+ * Collects original resource names directly from R$ classes in dex files
+ * using dexlib2 API. No smali decode needed.
  */
 public class ResourceDeobfuscator {
 
     /**
-     * Scan all smali files for R$ resource ID fields.
+     * Scan all dex files in APK for R$ resource ID fields.
      * Returns map: "0x7fXXYYYY" -> "originalFieldName"
      */
-    public static Map<String, String> collectLostResourceNames(File outDir) throws IOException {
+    public static Map<String, String> collectLostResourceNames(File apkFile) throws IOException {
         Map<String, String> map = new HashMap<>();
 
-        Path base = outDir.toPath();
-        if (!Files.exists(base)) return map;
+        ZipDexContainer container = new ZipDexContainer(apkFile, null);
+        try {
+            container.getEntry(""); // eager init
+        } catch (IOException ignored) {
+            return map;
+        }
 
-        Files.walk(base)
-            .filter(Files::isRegularFile)
-            .filter(path -> {
-                String s = path.toString();
-                return (s.contains("smali") || s.contains("smali_")) && s.endsWith(".smali");
-            })
-            .forEach(path -> {
-                try {
-                    collectFromSmali(path, map);
-                } catch (IOException ignored) {
-                }
-            });
+        for (String dexName : container.getDexEntryNames()) {
+            try {
+                ZipDexContainer.DexEntry<DexBackedDexFile> entry = container.getEntry(dexName);
+                if (entry == null) continue;
+                DexBackedDexFile dexFile = entry.getDexFile();
+                collectFromDex(dexFile, map);
+            } catch (Exception ignored) {
+            }
+        }
 
         return map;
     }
 
-    private static void collectFromSmali(Path path, Map<String, String> map) throws IOException {
-        boolean isStyleClass = path.toString().contains("$style");
+    private static void collectFromDex(DexBackedDexFile dexFile, Map<String, String> map) {
+        for (ClassDef classDef : dexFile.getClasses()) {
+            String className = classDef.getType(); // e.g. "Lcom/example/R$drawable;"
 
-        try (BufferedReader br = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-            String line;
-            boolean inStaticFields = false;
+            // Only process R$ inner classes
+            if (!className.contains("/R$") && !className.contains("$R$")) {
+                continue;
+            }
 
-            while ((line = br.readLine()) != null) {
-                if (line.startsWith("# static fields")) {
-                    inStaticFields = true;
-                    continue;
-                }
-                if (line.startsWith("# direct methods") || line.startsWith("# virtual methods")) {
-                    inStaticFields = false;
-                    continue;
-                }
+            boolean isStyleClass = className.endsWith("$style;") || className.endsWith("$styleable;");
 
-                if (!inStaticFields) continue;
-                if (!line.startsWith(".field public static final ")) continue;
-                if (!line.contains(":I = ")) continue;
+            for (Field field : classDef.getStaticFields()) {
+                // Only int fields (resource IDs)
+                if (!field.getType().equals("I")) continue;
 
-                // .field public static final fieldName:I = 0x7fXXYYYY
-                String cleaned = line.substring(".field public static final ".length());
+                EncodedValue initValue = field.getInitialValue();
+                if (initValue == null) continue;
+                if (!(initValue instanceof IntEncodedValue)) continue;
 
-                // For R$style, field names use _ instead of . for style parent refs
+                int value = ((IntEncodedValue) initValue).getValue();
+                // Only app resources (0x7f prefix)
+                if ((value & 0xFF000000) != 0x7F000000) continue;
+
+                String fieldName = field.getName();
                 if (isStyleClass) {
-                    cleaned = cleaned.replace("_", ".");
+                    fieldName = fieldName.replace("_", ".");
                 }
 
-                String[] parts = cleaned.split(":I = ");
-                if (parts.length == 2 && parts[1].startsWith("0x7f")) {
-                    map.put(parts[1].trim(), parts[0].trim());
-                }
+                String hexId = String.format("0x%08x", value);
+                map.put(hexId, fieldName);
             }
         }
     }

@@ -83,28 +83,16 @@ public class ApkDecoder {
             Log.i(TAG, "Using Apktool " + mConfig.getVersion() + " on " + mApkFile.getName()
                      + (mWorker != null ? " with " + mConfig.getJobs() + " threads" : ""));
 
-            decodeSources(outDir);
-
-            if (mWorker != null) {
-                mWorker.waitForFinish();
-                if (mFirstError.get() != null) {
-                    throw mFirstError.get();
-                }
-            }
-
-            // Collect original resource names from R$*.smali before decoding resources
+            // Collect original resource names directly from dex (no smali needed)
             try {
-                Map<String, String> lostNames = brut.androlib.smali.ResourceDeobfuscator.collectLostResourceNames(outDir);
+                Map<String, String> lostNames = brut.androlib.smali.ResourceDeobfuscator.collectLostResourceNames(mApkFile);
                 brut.androlib.res.table.ResPackage.setLostResourceNames(lostNames);
-                Log.i(TAG, "Collected " + lostNames.size() + " original resource names from smali");
+                Log.i(TAG, "Collected " + lostNames.size() + " original resource names from dex");
             } catch (java.io.IOException ex) {
                 Log.w(TAG, "Failed to collect resource names: " + ex.getMessage());
             }
 
-            if (mConfig.getJobs() > 1) {
-                mWorker = new BackgroundWorker(mConfig.getJobs() - 1);
-            }
-
+            decodeSources(outDir);
             decodeResources(outDir);
             decodeManifest(outDir);
 
