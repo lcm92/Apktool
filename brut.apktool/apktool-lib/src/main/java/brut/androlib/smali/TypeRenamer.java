@@ -50,11 +50,16 @@ public class TypeRenamer {
         }
         if (packages.length > 0) result.append("/");
 
+        // Only rename class names if they're in an obfuscated context.
+        // Classes in real packages (java/, android/, com/...) must NOT be renamed
+        // even if their name is short (Set, Map, Log, Uri, etc.)
+        boolean renameClassNames = wrapInDef;
+
         String[] classParts = classAndInner.split("\\$", -1);
         for (int j = 0; j < classParts.length; j++) {
             if (j > 0) result.append("$");
             String part = classParts[j];
-            if (isObfuscatedClassName(part)) {
+            if (renameClassNames && isObfuscatedClassName(part)) {
                 if (j == 0) {
                     result.append(renameOuterClass(part, packages));
                 } else {
