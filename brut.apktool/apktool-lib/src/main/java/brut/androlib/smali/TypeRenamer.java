@@ -196,8 +196,7 @@ public class TypeRenamer {
 
     private static final java.util.Set<String> SYSTEM_PACKAGES = new java.util.HashSet<>(
         java.util.Arrays.asList(
-            "java", "javax", "android", "dalvik", "kotlin", "kotlinx",
-            "sun", "org"
+            "java", "javax", "android", "dalvik", "sun"
         )
     );
 
