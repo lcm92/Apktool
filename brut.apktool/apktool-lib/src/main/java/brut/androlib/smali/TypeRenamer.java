@@ -50,10 +50,9 @@ public class TypeRenamer {
         }
         if (packages.length > 0) result.append("/");
 
-        // Only rename class names if they're in an obfuscated context.
-        // Classes in real packages (java/, android/, com/...) must NOT be renamed
-        // even if their name is short (Set, Map, Log, Uri, etc.)
-        boolean renameClassNames = wrapInDef;
+        // Rename class names everywhere except in system/framework packages
+        // where short names are legitimate (java/util/Set, android/system/Os, etc.)
+        boolean renameClassNames = packages.length == 0 || !isSystemPackage(packages[0]);
 
         String[] classParts = classAndInner.split("\\$", -1);
         for (int j = 0; j < classParts.length; j++) {
@@ -191,6 +190,20 @@ public class TypeRenamer {
             }
         }
         return ctx.toString();
+    }
+
+    // ========== System package detection ==========
+
+    private static final java.util.Set<String> SYSTEM_PACKAGES = new java.util.HashSet<>(
+        java.util.Arrays.asList(
+            "java", "javax", "android", "dalvik", "kotlin", "kotlinx",
+            "sun", "org"
+        )
+    );
+
+    /** Check if the top-level package is a system/framework package where short class names are legitimate. */
+    static boolean isSystemPackage(String topPackage) {
+        return SYSTEM_PACKAGES.contains(topPackage);
     }
 
     // ========== Detection helpers ==========
