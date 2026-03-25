@@ -33,11 +33,13 @@ public class TypeRenamer {
         String classAndInner = pathParts[pathParts.length - 1];
 
         boolean wrapInDef;
-        if (packages.length > 0) {
-            wrapInDef = false;
-        } else {
+        if (packages.length == 0) {
             String outerClass = classAndInner.split("\\$", -1)[0];
             wrapInDef = isObfuscatedDefaultClass(outerClass);
+        } else if (packages.length == 1) {
+            wrapInDef = isObfuscatedPackage(packages[0]);
+        } else {
+            wrapInDef = false;
         }
 
         StringBuilder result = new StringBuilder("L");
