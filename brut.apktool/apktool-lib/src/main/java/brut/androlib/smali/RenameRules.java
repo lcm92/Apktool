@@ -1,0 +1,199 @@
+/*
+ *  Copyright (C) 2010 Ryszard Wiśniewski <brut.alll@gmail.com>
+ *  Copyright (C) 2010 Connor Tumbleson <connor.tumbleson@gmail.com>
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *       https://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+package brut.androlib.smali;
+
+import java.io.*;
+import java.util.*;
+import java.util.regex.Pattern;
+
+public class RenameRules {
+    public static final String FILE_NAME = "rename-rules.properties";
+
+    // Default regex patterns
+    private static final String DEFAULT_PKG_PATTERN =
+        "^[a-zA-Z]$|^(?=.*[0-9])[a-zA-Z][a-zA-Z0-9]{1,2}$";
+    private static final String DEFAULT_CLS_PATTERN =
+        "^[a-zA-Z][a-zA-Z0-9]{0,2}$";
+    private static final String DEFAULT_DEF_CLS_PATTERN =
+        "^[a-zA-Z][a-zA-Z0-9]{0,2}$";
+
+    // Current values
+    private static String sDefPackage = "def";
+    private static String sPkgPatternStr = DEFAULT_PKG_PATTERN;
+    private static String sClsPatternStr = DEFAULT_CLS_PATTERN;
+    private static String sDefClsPatternStr = DEFAULT_DEF_CLS_PATTERN;
+    private static Pattern sPkgPattern = Pattern.compile(DEFAULT_PKG_PATTERN);
+    private static Pattern sClsPattern = Pattern.compile(DEFAULT_CLS_PATTERN);
+    private static Pattern sDefClsPattern = Pattern.compile(DEFAULT_DEF_CLS_PATTERN);
+    private static Set<String> sSystemPackages = new HashSet<>(
+        Arrays.asList("java", "javax", "android", "dalvik", "sun")
+    );
+
+    public static String getDefPackage() { return sDefPackage; }
+    public static Pattern getPkgPattern() { return sPkgPattern; }
+    public static Pattern getClsPattern() { return sClsPattern; }
+    public static Pattern getDefClsPattern() { return sDefClsPattern; }
+    public static Set<String> getSystemPackages() { return sSystemPackages; }
+
+    public static void resetDefaults() {
+        sDefPackage = "def";
+        sPkgPatternStr = DEFAULT_PKG_PATTERN;
+        sClsPatternStr = DEFAULT_CLS_PATTERN;
+        sDefClsPatternStr = DEFAULT_DEF_CLS_PATTERN;
+        sPkgPattern = Pattern.compile(DEFAULT_PKG_PATTERN);
+        sClsPattern = Pattern.compile(DEFAULT_CLS_PATTERN);
+        sDefClsPattern = Pattern.compile(DEFAULT_DEF_CLS_PATTERN);
+        sSystemPackages = new HashSet<>(
+            Arrays.asList("java", "javax", "android", "dalvik", "sun")
+        );
+    }
+
+    public static void loadFromDir(File dir) {
+        File file = new File(dir, FILE_NAME);
+        if (!file.exists()) {
+            resetDefaults();
+            return;
+        }
+        Properties props = new Properties();
+        try (FileInputStream fis = new FileInputStream(file)) {
+            props.load(fis);
+        } catch (IOException e) {
+            resetDefaults();
+            return;
+        }
+        sDefPackage = props.getProperty("def_package", "def").trim();
+
+        sPkgPatternStr = props.getProperty("pkg_pattern", DEFAULT_PKG_PATTERN).trim();
+        sClsPatternStr = props.getProperty("cls_pattern", DEFAULT_CLS_PATTERN).trim();
+        sDefClsPatternStr = props.getProperty("default_cls_pattern", DEFAULT_DEF_CLS_PATTERN).trim();
+        try {
+            sPkgPattern = Pattern.compile(sPkgPatternStr);
+        } catch (Exception e) {
+            sPkgPatternStr = DEFAULT_PKG_PATTERN;
+            sPkgPattern = Pattern.compile(DEFAULT_PKG_PATTERN);
+        }
+        try {
+            sClsPattern = Pattern.compile(sClsPatternStr);
+        } catch (Exception e) {
+            sClsPatternStr = DEFAULT_CLS_PATTERN;
+            sClsPattern = Pattern.compile(DEFAULT_CLS_PATTERN);
+        }
+        try {
+            sDefClsPattern = Pattern.compile(sDefClsPatternStr);
+        } catch (Exception e) {
+            sDefClsPatternStr = DEFAULT_DEF_CLS_PATTERN;
+            sDefClsPattern = Pattern.compile(DEFAULT_DEF_CLS_PATTERN);
+        }
+
+        String sysPkgs = props.getProperty("system_packages", "java,javax,android,dalvik,sun");
+        sSystemPackages = new HashSet<>();
+        for (String pkg : sysPkgs.split(",")) {
+            String trimmed = pkg.trim();
+            if (!trimmed.isEmpty()) {
+                sSystemPackages.add(trimmed);
+            }
+        }
+    }
+
+    public static void saveToDir(File dir) {
+        File file = new File(dir, FILE_NAME);
+        try (PrintWriter pw = new PrintWriter(new OutputStreamWriter(
+                new FileOutputStream(file), "UTF-8"))) {
+            pw.println("# =============================================================================");
+            pw.println("# Rename Rules - Auto-generated by Apktool Custom");
+            pw.println("# Modify these rules to customize obfuscation detection and renaming.");
+            pw.println("# Re-decode the APK with -f flag to apply changes.");
+            pw.println("#");
+            pw.println("# NOTE: This file uses Java Properties format.");
+            pw.println("#   Backslash is an escape char: to write \\d in regex, use \\\\d");
+            pw.println("#   Prefer [0-9] over \\\\d, [a-zA-Z] over \\\\w for clarity.");
+            pw.println("# =============================================================================");
+            pw.println();
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("# WRAPPER PACKAGE");
+            pw.println("# All detected obfuscated packages and default-package classes");
+            pw.println("# are moved under this package.");
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("def_package=" + sDefPackage);
+            pw.println();
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("# PACKAGE NAME DETECTION (Java regex, matched against each package segment)");
+            pw.println("#");
+            pw.println("# If the first package segment matches this pattern -> obfuscated -> wrap in def/");
+            pw.println("#");
+            pw.println("# Default pattern explained:");
+            pw.println("#   [a-zA-Z]                                   1 letter char: a, B, c");
+            pw.println("#   (?=.*[0-9])[a-zA-Z][a-zA-Z0-9]{1,2}       2-3 chars with digit: a9, a90, ad0");
+            pw.println("#");
+            pw.println("# NOT matched (safe): cn, io, com, net, org (2+ chars all-letter)");
+            pw.println("#");
+            pw.println("# PACKAGE RENAME RULE:");
+            pw.println("#   lowercase pkg -> kept as-is:     a -> a, a90 -> a90");
+            pw.println("#   UPPERCASE pkg -> prefix '_':     A -> _a, Ab -> _ab, A90 -> _a90");
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("pkg_pattern=" + sPkgPatternStr);
+            pw.println();
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("# DEFAULT PACKAGE CLASS DETECTION");
+            pw.println("# (Java regex, for classes with NO parent package, e.g. La90; Lab;)");
+            pw.println("#");
+            pw.println("# If matched -> class is moved under def_package and renamed.");
+            pw.println("#");
+            pw.println("# Default pattern: [a-zA-Z][a-zA-Z0-9]{0,2}  (1-3 chars starting with letter)");
+            pw.println("#   Match:    a, Ab, a90, Cg0");
+            pw.println("#   No match: View, Activity (4+ chars)");
+            pw.println("#");
+            pw.println("# RENAME RULE:");
+            pw.println("#   Name uppercased, no context suffix.");
+            pw.println("#   La;      -> Ldef/A;");
+            pw.println("#   Lab;     -> Ldef/AB;");
+            pw.println("#   La90;    -> Ldef/A90;");
+            pw.println("#   LCd;     -> Ldef/_CD;       (was uppercase -> '_' prefix)");
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("default_cls_pattern=" + sDefClsPatternStr);
+            pw.println();
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("# IN-PACKAGE CLASS NAME DETECTION");
+            pw.println("# (Java regex, for classes inside a package, e.g. La/b; Lcom/a/Bc;)");
+            pw.println("#");
+            pw.println("# If matched -> class name is renamed (does NOT affect def/ wrapping).");
+            pw.println("#");
+            pw.println("# Default pattern: [a-zA-Z][a-zA-Z0-9]{0,2}  (1-3 chars starting with letter)");
+            pw.println("#");
+            pw.println("# RENAME RULE:");
+            pw.println("#   Name uppercased + first char of up to 3 nearest parent packages as context.");
+            pw.println("#   La/b;         -> Ldef/a/BA;           (context: A from 'a')");
+            pw.println("#   La/b/c;       -> Ldef/a/b/CBA;        (context: A from 'a', B from 'b')");
+            pw.println("#   La/b/c/d;     -> Ldef/a/b/c/DCBA;     (3 nearest: c,b,a)");
+            pw.println("#   La/b/c/d/e;   -> Ldef/a/b/c/d/EDCB;   (3 nearest: d,c,b)");
+            pw.println("#");
+            pw.println("#   Inner class: uppercased + first char of parent class + depth.");
+            pw.println("#   La/b$c;  -> Ldef/a/BA$CB1;    ('c' -> C + B from parent + depth 1)");
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("cls_pattern=" + sClsPatternStr);
+            pw.println();
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("# SYSTEM PACKAGES");
+            pw.println("# Top-level packages to skip class renaming (short names are legitimate).");
+            pw.println("# Example: java/util/Set, android/os/Os are NOT obfuscated.");
+            pw.println("# Comma-separated list.");
+            pw.println("# -----------------------------------------------------------------------------");
+            pw.println("system_packages=" + String.join(",", new TreeSet<>(sSystemPackages)));
+        } catch (IOException ignored) {
+        }
+    }
+}
