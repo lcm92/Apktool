@@ -16,16 +16,9 @@
  */
 package brut.androlib.smali;
 
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.regex.Pattern;
 
 public class TypeRenamer {
-
-    private static final Set<String> COUNTRY_CODE_SUBDOMAINS = new HashSet<>(
-        Arrays.asList("com", "org", "net", "co", "edu", "gov", "ac", "mil")
-    );
 
     public static String renameType(String type) {
         if (type == null || type.isEmpty()) return type;
@@ -41,8 +34,7 @@ public class TypeRenamer {
 
         boolean wrapInDef;
         if (packages.length > 0) {
-            wrapInDef = isObfuscatedPackage(packages[0])
-                && !isCountryCodeTLD(packages);
+            wrapInDef = false;
         } else {
             String outerClass = classAndInner.split("\\$", -1)[0];
             wrapInDef = isObfuscatedDefaultClass(outerClass);
@@ -217,17 +209,6 @@ public class TypeRenamer {
 
     static boolean isSystemPackage(String topPackage) {
         return RenameRules.getSystemPackages().contains(topPackage);
-    }
-
-    static boolean isCountryCodeTLD(String[] packages) {
-        // cn/com/..., uk/co/..., jp/org/... → legitimate country-code TLD
-        if (packages.length >= 2
-                && packages[0].length() == 2
-                && packages[0].chars().allMatch(Character::isLetter)
-                && COUNTRY_CODE_SUBDOMAINS.contains(packages[1])) {
-            return true;
-        }
-        return false;
     }
 
     static boolean isObfuscatedPackage(String seg) {
