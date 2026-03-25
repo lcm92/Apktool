@@ -161,6 +161,19 @@ public class SmaliDecoder {
         } catch (IOException ignored) {
         }
 
+        // Fix Signature annotations - type references in generic signatures are stored
+        // as plain strings and not rewritten by DexRewriter's TypeRewriter
+        try {
+            fixSignatureAnnotations(smaliDir);
+        } catch (IOException ignored) {
+        }
+
+        // Fix Kotlin Metadata d2 annotations - type references stored as plain strings
+        try {
+            fixKotlinMetadataAnnotations(smaliDir);
+        } catch (IOException ignored) {
+        }
+
         int apiLevel = dexFile.getOpcodes().api;
         mInferredApiLevel.updateAndGet(cur -> (cur == 0 || cur > apiLevel) ? apiLevel : cur);
     }
@@ -178,6 +191,122 @@ public class SmaliDecoder {
             }
         }
     }
+
+    // ========== Signature annotation fix ==========
+
+    private static final Pattern SIG_TYPE_PATTERN = Pattern.compile("L[a-zA-Z][a-zA-Z0-9_/$]*[a-zA-Z0-9_]");
+
+    private static void fixSignatureAnnotations(File dir) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                fixSignatureAnnotations(file);
+            } else if (file.getName().endsWith(".smali")) {
+                fixSignatureAnnotation(file);
+            }
+        }
+    }
+
+    private static void fixSignatureAnnotation(File smaliFile) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+
+        boolean inSignature = false;
+        boolean modified = false;
+
+        for (int i = 0; i < lines.size(); i++) {
+            String trimmed = lines.get(i).trim();
+            if (trimmed.equals(".annotation system Ldalvik/annotation/Signature;")) {
+                inSignature = true;
+            } else if (trimmed.equals(".end annotation") && inSignature) {
+                inSignature = false;
+            } else if (inSignature && trimmed.startsWith("\"")) {
+                // Process string values in the Signature annotation
+                String line = lines.get(i);
+                String newLine = renameTypesInSignatureLine(line);
+                if (!newLine.equals(line)) {
+                    lines.set(i, newLine);
+                    modified = true;
+                }
+            }
+        }
+
+        if (modified) {
+            Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
+        }
+    }
+
+    private static String renameTypesInSignatureLine(String line) {
+        // Find type references like Lpackage/Class in the line and rename them
+        Matcher m = SIG_TYPE_PATTERN.matcher(line);
+        StringBuilder sb = new StringBuilder();
+        int lastEnd = 0;
+        while (m.find()) {
+            String typeRef = m.group(); // e.g. "Lnl/f" or "Lnl/g"
+            // Build a full type descriptor to pass to renameType
+            // The ';' might be later in the string or in the next fragment
+            String fullType = typeRef + ";";
+            String renamed = TypeRenamer.renameType(fullType);
+            // Strip the trailing ';' since it's not part of our match
+            String renamedRef = renamed.substring(0, renamed.length() - 1);
+
+            sb.append(line, lastEnd, m.start());
+            sb.append(renamedRef);
+            lastEnd = m.end();
+        }
+        if (lastEnd == 0) return line;
+        sb.append(line, lastEnd, line.length());
+        return sb.toString();
+    }
+
+    // ========== Kotlin Metadata annotation fix ==========
+
+    private static void fixKotlinMetadataAnnotations(File dir) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                fixKotlinMetadataAnnotations(file);
+            } else if (file.getName().endsWith(".smali")) {
+                fixKotlinMetadataAnnotation(file);
+            }
+        }
+    }
+
+    private static void fixKotlinMetadataAnnotation(File smaliFile) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+
+        boolean inKotlinMetadata = false;
+        boolean inD2 = false;
+        boolean modified = false;
+
+        for (int i = 0; i < lines.size(); i++) {
+            String trimmed = lines.get(i).trim();
+            if (trimmed.equals(".annotation runtime Lkotlin/Metadata;")) {
+                inKotlinMetadata = true;
+            } else if (trimmed.equals(".end annotation") && inKotlinMetadata) {
+                inKotlinMetadata = false;
+                inD2 = false;
+            } else if (inKotlinMetadata && trimmed.equals("d2 = {")) {
+                inD2 = true;
+            } else if (inD2 && trimmed.equals("}")) {
+                inD2 = false;
+            } else if (inD2 && trimmed.startsWith("\"")) {
+                String line = lines.get(i);
+                String newLine = renameTypesInSignatureLine(line);
+                if (!newLine.equals(line)) {
+                    lines.set(i, newLine);
+                    modified = true;
+                }
+            }
+        }
+
+        if (modified) {
+            Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
+        }
+    }
+
+    // ========== InnerClass annotation fix ==========
 
     private static void fixInnerClassAnnotation(File smaliFile) throws IOException {
         List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
