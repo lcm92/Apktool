@@ -16,9 +16,16 @@
  */
 package brut.androlib.smali;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.regex.Pattern;
+
 public class TypeRenamer {
 
-    private static final String DEF_PACKAGE = "def";
+    private static final Set<String> COUNTRY_CODE_SUBDOMAINS = new HashSet<>(
+        Arrays.asList("com", "org", "net", "co", "edu", "gov", "ac", "mil")
+    );
 
     public static String renameType(String type) {
         if (type == null || type.isEmpty()) return type;
@@ -32,17 +39,17 @@ public class TypeRenamer {
         System.arraycopy(pathParts, 0, packages, 0, packages.length);
         String classAndInner = pathParts[pathParts.length - 1];
 
-        // Decide def/ wrapping: packages use 1-2 char rule, root classes use 1-3 char rule
         boolean wrapInDef;
         if (packages.length > 0) {
-            wrapInDef = isObfuscatedPackage(packages[0]);
+            wrapInDef = isObfuscatedPackage(packages[0])
+                && !isCountryCodeTLD(packages);
         } else {
             String outerClass = classAndInner.split("\\$", -1)[0];
-            wrapInDef = isObfuscatedClassName(outerClass);
+            wrapInDef = isObfuscatedDefaultClass(outerClass);
         }
 
         StringBuilder result = new StringBuilder("L");
-        if (wrapInDef) result.append(DEF_PACKAGE).append("/");
+        if (wrapInDef) result.append(RenameRules.getDefPackage()).append("/");
 
         for (int i = 0; i < packages.length; i++) {
             if (i > 0) result.append("/");
@@ -50,15 +57,16 @@ public class TypeRenamer {
         }
         if (packages.length > 0) result.append("/");
 
-        // Rename class names everywhere except in system/framework packages
-        // where short names are legitimate (java/util/Set, android/system/Os, etc.)
         boolean renameClassNames = packages.length == 0 || !isSystemPackage(packages[0]);
 
         String[] classParts = classAndInner.split("\\$", -1);
         for (int j = 0; j < classParts.length; j++) {
             if (j > 0) result.append("$");
             String part = classParts[j];
-            if (renameClassNames && isObfuscatedClassName(part)) {
+            boolean obfuscated = packages.length == 0
+                ? isObfuscatedDefaultClass(part)
+                : isObfuscatedClassName(part);
+            if (renameClassNames && obfuscated) {
                 if (j == 0) {
                     result.append(renameOuterClass(part, packages));
                 } else {
@@ -81,7 +89,7 @@ public class TypeRenamer {
         String[] pathParts = inner.split("/");
 
         int startIdx = 0;
-        if (pathParts.length > 1 && pathParts[0].equals(DEF_PACKAGE)) startIdx = 1;
+        if (pathParts.length > 1 && pathParts[0].equals(RenameRules.getDefPackage())) startIdx = 1;
 
         int pkgCount = pathParts.length - 1 - startIdx;
         String[] originalPackages = new String[pkgCount];
@@ -113,29 +121,31 @@ public class TypeRenamer {
         return result.toString();
     }
 
-    // ========== Package rename (1-2 chars) ==========
+    // ========== Package rename ==========
 
     static String renamePackageSegment(String seg) {
         if (seg.isEmpty()) return seg;
-        if (isObfuscatedUppercasePackage(seg)) return "_" + seg.toLowerCase();
+        if (isObfuscatedPackage(seg) && Character.isUpperCase(seg.charAt(0))) {
+            return "_" + seg.toLowerCase();
+        }
         return seg;
     }
 
     static String unrenamePackageSegment(String seg) {
         if (seg.isEmpty()) return seg;
-        if (seg.charAt(0) == '_' && seg.length() >= 2 && seg.length() <= 3) {
-            String rest = seg.substring(1);
-            if (rest.length() >= 1 && rest.length() <= 2 && Character.isLowerCase(rest.charAt(0))) {
-                return Character.toUpperCase(rest.charAt(0)) + rest.substring(1);
+        if (seg.charAt(0) == '_' && seg.length() >= 2) {
+            String candidate = Character.toUpperCase(seg.charAt(1)) + seg.substring(2);
+            if (RenameRules.getPkgPattern().matcher(candidate).matches()) {
+                return candidate;
             }
         }
         return seg;
     }
 
-    // ========== Outer class rename (1-3 chars) ==========
+    // ========== Outer class rename ==========
 
     static String renameOuterClass(String name, String[] packages) {
-        String prefix = isObfuscatedUppercaseClassName(name) ? "_" : "";
+        String prefix = (Character.isUpperCase(name.charAt(0))) ? "_" : "";
         return prefix + name.toUpperCase() + getPackageContext(packages);
     }
 
@@ -146,22 +156,30 @@ public class TypeRenamer {
         if (expectedContext.length() > 0 && name.endsWith(expectedContext)) {
             name = name.substring(0, name.length() - expectedContext.length());
         }
-        if (name.length() >= 1 && name.length() <= 3) {
-            if (wasUppercase) return Character.toUpperCase(name.charAt(0)) + name.substring(1);
-            else return name.toLowerCase();
+        if (name.isEmpty()) return renamed;
+        String candidate = wasUppercase
+            ? Character.toUpperCase(name.charAt(0)) + name.substring(1)
+            : name.toLowerCase();
+        Pattern pattern = originalPackages.length == 0
+            ? RenameRules.getDefClsPattern()
+            : RenameRules.getClsPattern();
+        if (pattern.matcher(candidate).matches()) {
+            return candidate;
         }
         return renamed;
     }
 
-    // ========== Inner class rename (1-3 chars) ==========
+    // ========== Inner class rename ==========
 
     static String renameInnerClass(String name, String parentOriginal, int depth) {
-        String prefix = isObfuscatedUppercaseClassName(name) ? "_" : "";
+        if (parentOriginal.isEmpty()) return name;
+        String prefix = (Character.isUpperCase(name.charAt(0))) ? "_" : "";
         char parentChar = Character.toUpperCase(parentOriginal.charAt(0));
         return prefix + name.toUpperCase() + parentChar + depth;
     }
 
     static String unrenameInnerClass(String renamed, String parentOriginal, int depth) {
+        if (parentOriginal.isEmpty()) return renamed;
         boolean wasUppercase = renamed.startsWith("_");
         String name = wasUppercase ? renamed.substring(1) : renamed;
         char expectedParentChar = Character.toUpperCase(parentOriginal.charAt(0));
@@ -169,9 +187,12 @@ public class TypeRenamer {
         if (name.endsWith(expectedSuffix)) {
             name = name.substring(0, name.length() - expectedSuffix.length());
         }
-        if (name.length() >= 1 && name.length() <= 3) {
-            if (wasUppercase) return Character.toUpperCase(name.charAt(0)) + name.substring(1);
-            else return name.toLowerCase();
+        if (name.isEmpty()) return renamed;
+        String candidate = wasUppercase
+            ? Character.toUpperCase(name.charAt(0)) + name.substring(1)
+            : name.toLowerCase();
+        if (RenameRules.getClsPattern().matcher(candidate).matches()) {
+            return candidate;
         }
         return renamed;
     }
@@ -183,7 +204,7 @@ public class TypeRenamer {
         int count = Math.min(3, packages.length);
         for (int i = 0; i < count; i++) {
             String pkg = packages[packages.length - 1 - i];
-            if (isObfuscatedUppercasePackage(pkg)) {
+            if (isObfuscatedPackage(pkg) && Character.isUpperCase(pkg.charAt(0))) {
                 ctx.append("_").append(Character.toUpperCase(pkg.charAt(0)));
             } else {
                 ctx.append(Character.toUpperCase(pkg.charAt(0)));
@@ -192,44 +213,35 @@ public class TypeRenamer {
         return ctx.toString();
     }
 
-    // ========== System package detection ==========
+    // ========== Detection ==========
 
-    private static final java.util.Set<String> SYSTEM_PACKAGES = new java.util.HashSet<>(
-        java.util.Arrays.asList(
-            "java", "javax", "android", "dalvik", "sun"
-        )
-    );
-
-    /** Check if the top-level package is a system/framework package where short class names are legitimate. */
     static boolean isSystemPackage(String topPackage) {
-        return SYSTEM_PACKAGES.contains(topPackage);
+        return RenameRules.getSystemPackages().contains(topPackage);
     }
 
-    // ========== Detection helpers ==========
+    static boolean isCountryCodeTLD(String[] packages) {
+        // cn/com/..., uk/co/..., jp/org/... → legitimate country-code TLD
+        if (packages.length >= 2
+                && packages[0].length() == 2
+                && packages[0].chars().allMatch(Character::isLetter)
+                && COUNTRY_CODE_SUBDOMAINS.contains(packages[1])) {
+            return true;
+        }
+        return false;
+    }
 
-    /** Package obfuscation: 1-3 chars starting with letter or underscore (avoids com, org, net) */
     static boolean isObfuscatedPackage(String seg) {
         if (seg.isEmpty()) return false;
-        char first = seg.charAt(0);
-        if (first == '_') return seg.length() >= 2 && seg.length() <= 3;
-        return seg.length() >= 1 && seg.length() <= 2 && Character.isLetter(first);
+        return RenameRules.getPkgPattern().matcher(seg).matches();
     }
 
-    /** Package uppercase: 1-2 chars starting with uppercase */
-    static boolean isObfuscatedUppercasePackage(String seg) {
-        return seg.length() >= 1 && seg.length() <= 2 && Character.isUpperCase(seg.charAt(0));
-    }
-
-    /** Class name obfuscation: 1-3 chars starting with letter or underscore */
     static boolean isObfuscatedClassName(String seg) {
         if (seg.isEmpty()) return false;
-        char first = seg.charAt(0);
-        if (first == '_') return seg.length() >= 2 && seg.length() <= 4;
-        return seg.length() >= 1 && seg.length() <= 3 && Character.isLetter(first);
+        return RenameRules.getClsPattern().matcher(seg).matches();
     }
 
-    /** Class name uppercase: 1-3 chars starting with uppercase */
-    static boolean isObfuscatedUppercaseClassName(String seg) {
-        return seg.length() >= 1 && seg.length() <= 3 && Character.isUpperCase(seg.charAt(0));
+    static boolean isObfuscatedDefaultClass(String seg) {
+        if (seg.isEmpty()) return false;
+        return RenameRules.getDefClsPattern().matcher(seg).matches();
     }
 }

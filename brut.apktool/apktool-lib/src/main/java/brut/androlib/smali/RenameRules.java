@@ -25,7 +25,7 @@ public class RenameRules {
 
     // Default regex patterns
     private static final String DEFAULT_PKG_PATTERN =
-        "^[a-zA-Z]$|^(?=.*[0-9])[a-zA-Z][a-zA-Z0-9]{1,2}$";
+        "^[a-zA-Z]{1,2}$|^(?=.*[0-9])[a-zA-Z][a-zA-Z0-9]{1,2}$";
     private static final String DEFAULT_CLS_PATTERN =
         "^[a-zA-Z][a-zA-Z0-9]{0,2}$";
     private static final String DEFAULT_DEF_CLS_PATTERN =
@@ -136,10 +136,11 @@ public class RenameRules {
             pw.println("# If the first package segment matches this pattern -> obfuscated -> wrap in def/");
             pw.println("#");
             pw.println("# Default pattern explained:");
-            pw.println("#   [a-zA-Z]                                   1 letter char: a, B, c");
+            pw.println("#   [a-zA-Z]{1,2}                              1-2 letter chars: a, ab, B, Cd");
             pw.println("#   (?=.*[0-9])[a-zA-Z][a-zA-Z0-9]{1,2}       2-3 chars with digit: a9, a90, ad0");
             pw.println("#");
-            pw.println("# NOT matched (safe): cn, io, com, net, org (2+ chars all-letter)");
+            pw.println("# NOT matched (safe): com, net, org, util (3+ chars all-letter)");
+            pw.println("# Country-code TLDs (cn/com/..., uk/co/...) are auto-detected and excluded.");
             pw.println("#");
             pw.println("# PACKAGE RENAME RULE:");
             pw.println("#   lowercase pkg -> kept as-is:     a -> a, a90 -> a90");
