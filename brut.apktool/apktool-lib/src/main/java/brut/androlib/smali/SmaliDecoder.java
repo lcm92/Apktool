@@ -28,6 +28,9 @@ import com.android.tools.smali.dexlib2.AccessFlags;
 import com.android.tools.smali.dexlib2.iface.ClassDef;
 import com.android.tools.smali.dexlib2.iface.DexFile;
 import com.android.tools.smali.dexlib2.iface.Method;
+import com.android.tools.smali.dexlib2.iface.MethodImplementation;
+import com.android.tools.smali.dexlib2.iface.debug.DebugItem;
+import com.android.tools.smali.dexlib2.iface.debug.LineNumber;
 import com.android.tools.smali.dexlib2.rewriter.DexRewriter;
 
 import java.io.File;
@@ -136,11 +139,16 @@ public class SmaliDecoder {
     private void decodeFile(DexBackedDexFile dexFile, File smaliDir) {
         int jobs = Math.min(Runtime.getRuntime().availableProcessors(), 6);
 
+        // If the dex carries R8-obfuscated line numbers (same line number reused
+        // across multiple methods of a class), drop debug info entirely - keeping
+        // it would make stack traces point at meaningless lines.
+        boolean keepDebugInfo = mDebugMode && !hasObfuscatedDebugLines(dexFile);
+
         BaksmaliOptions options = new BaksmaliOptions();
         options.parameterRegisters = true;
         options.localsDirective = true;
         options.sequentialLabels = true;
-        options.debugInfo = mDebugMode;
+        options.debugInfo = keepDebugInfo;
         options.codeOffsets = false;
         options.accessorComments = false;
         options.allowOdex = false;
@@ -203,16 +211,6 @@ public class SmaliDecoder {
         // literal sput of the renamed FQN.
         try {
             fixHiltLazyMapKeyClinits(smaliDir);
-        } catch (IOException ignored) {
-        }
-
-        // Strip ALL .line directives from any smali file that contains at least one
-        // line number larger than the JVM class-file spec limit (u2, 65535). Such a
-        // value can never come from real source and indicates R8 line obfuscation
-        // or corrupted debug info; mixing valid + invalid line numbers in stack
-        // traces is more confusing than dropping them entirely.
-        try {
-            stripSuspiciousLineDirectives(smaliDir);
         } catch (IOException ignored) {
         }
 
@@ -348,55 +346,38 @@ public class SmaliDecoder {
         }
     }
 
-    // ========== Suspicious .line directive strip ==========
+    // ========== Obfuscated debug-line detection ==========
 
-    private static final Pattern LINE_DIRECTIVE_PATTERN = Pattern.compile(
-        "^\\s*\\.line\\s+(\\d+)\\s*$"
-    );
-
-    /** JVM spec: LineNumberTable line_number is u2. Anything above is invalid. */
-    private static final int MAX_VALID_LINE_NUMBER = 65535;
-
-    private static void stripSuspiciousLineDirectives(File dir) throws IOException {
-        File[] files = dir.listFiles();
-        if (files == null) return;
-        for (File file : files) {
-            if (file.isDirectory()) {
-                stripSuspiciousLineDirectives(file);
-            } else if (file.getName().endsWith(".smali")) {
-                stripSuspiciousLineDirectivesInFile(file);
-            }
-        }
-    }
-
-    private static void stripSuspiciousLineDirectivesInFile(File smaliFile) throws IOException {
-        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
-
-        boolean hasSuspicious = false;
-        for (String line : lines) {
-            Matcher m = LINE_DIRECTIVE_PATTERN.matcher(line);
-            if (m.matches()) {
-                long n;
-                try {
-                    n = Long.parseLong(m.group(1));
-                } catch (NumberFormatException ex) {
-                    continue;
+    /**
+     * Returns true if any class in the dex has the same source line number
+     * appearing in more than one of its methods. In real Java/Kotlin source,
+     * methods in a class occupy disjoint line ranges, so a duplicated line
+     * across methods is a strong signal that R8 (or another obfuscator) has
+     * remapped LineNumberTable entries to non-source-faithful values. Stack
+     * traces emitted with such numbers are misleading; the caller can then
+     * disable {@code BaksmaliOptions.debugInfo} so debug info is dropped at
+     * decode time instead.
+     */
+    private static boolean hasObfuscatedDebugLines(DexBackedDexFile dexFile) {
+        for (ClassDef cls : dexFile.getClasses()) {
+            Set<Integer> seen = new HashSet<>();
+            for (Method m : cls.getMethods()) {
+                MethodImplementation impl = m.getImplementation();
+                if (impl == null) continue;
+                Set<Integer> methodLines = new HashSet<>();
+                for (DebugItem di : impl.getDebugItems()) {
+                    if (di instanceof LineNumber) {
+                        methodLines.add(((LineNumber) di).getLineNumber());
+                    }
                 }
-                if (n > MAX_VALID_LINE_NUMBER) {
-                    hasSuspicious = true;
-                    break;
+                for (Integer line : methodLines) {
+                    if (!seen.add(line)) {
+                        return true;
+                    }
                 }
             }
         }
-        if (!hasSuspicious) return;
-
-        List<String> filtered = new ArrayList<>(lines.size());
-        for (String line : lines) {
-            if (!LINE_DIRECTIVE_PATTERN.matcher(line).matches()) {
-                filtered.add(line);
-            }
-        }
-        Files.write(smaliFile.toPath(), filtered, StandardCharsets.UTF_8);
+        return false;
     }
 
     // ========== Native-method class detection ==========
