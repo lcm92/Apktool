@@ -24,13 +24,19 @@ import com.android.tools.smali.dexlib2.analysis.InlineMethodResolver;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile;
 import com.android.tools.smali.dexlib2.dexbacked.DexBackedOdexFile;
 import com.android.tools.smali.dexlib2.dexbacked.ZipDexContainer;
+import com.android.tools.smali.dexlib2.AccessFlags;
+import com.android.tools.smali.dexlib2.iface.ClassDef;
 import com.android.tools.smali.dexlib2.iface.DexFile;
+import com.android.tools.smali.dexlib2.iface.Method;
 import com.android.tools.smali.dexlib2.rewriter.DexRewriter;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -148,8 +154,12 @@ public class SmaliDecoder {
                 ((DexBackedOdexFile) dexFile).getOdexVersion());
         }
 
-        // Rename obfuscated types to avoid case-insensitive filesystem collisions
-        DexRewriter rewriter = new DexRewriter(new ObfuscatedTypeRewriterModule());
+        // Rename obfuscated types to avoid case-insensitive filesystem collisions.
+        // Skip classes that declare native methods: JNI binds the native impl to the
+        // exact class FQN (auto-binding via Java_<pkg>_<class>_<method> or explicit
+        // FindClass/RegisterNatives in C/C++). Renaming breaks that lookup at runtime.
+        Set<String> nativeOwners = collectNativeMethodOwners(dexFile);
+        DexRewriter rewriter = new DexRewriter(new ObfuscatedTypeRewriterModule(nativeOwners));
         DexFile rewrittenDex = rewriter.getDexFileRewriter().rewrite(dexFile);
 
         OS.mkdir(smaliDir);
@@ -171,6 +181,28 @@ public class SmaliDecoder {
         // Fix Kotlin Metadata d2 annotations - type references stored as plain strings
         try {
             fixKotlinMetadataAnnotations(smaliDir);
+        } catch (IOException ignored) {
+        }
+
+        // Fix dotted class-FQN string literals (e.g. Hilt's @StringKey/LazyClassKey
+        // in HiltViewModelKeys map). DexRewriter's TypeRewriter only touches L...; type
+        // descriptors; strings like "g9.e" or "open.chat.x.a" inside const-string ops
+        // remain as the original obfuscated FQN and won't match Class.getName() of
+        // renamed classes at runtime.
+        try {
+            Map<String, String> fqnRenameMap = buildFqnRenameMap(dexFile);
+            if (!fqnRenameMap.isEmpty()) {
+                fixClassNameStringLiterals(smaliDir, fqnRenameMap);
+            }
+        } catch (IOException ignored) {
+        }
+
+        // Fix Hilt @LazyClassKey holder classes whose static String field is decoded
+        // at runtime from an obfuscated payload (the payload still encodes the
+        // original obfuscated FQN, not the renamed one). Replace <clinit> with a
+        // literal sput of the renamed FQN.
+        try {
+            fixHiltLazyMapKeyClinits(smaliDir);
         } catch (IOException ignored) {
         }
 
@@ -304,6 +336,225 @@ public class SmaliDecoder {
         if (modified) {
             Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
         }
+    }
+
+    // ========== Native-method class detection ==========
+
+    /**
+     * Returns the set of class types whose definition contains at least one
+     * method with the {@code native} access flag. These class FQNs are bound to
+     * a corresponding C/C++ symbol or used in {@code FindClass}/{@code RegisterNatives}
+     * calls, so renaming them breaks runtime native binding.
+     */
+    private static Set<String> collectNativeMethodOwners(DexBackedDexFile dexFile) {
+        Set<String> result = new HashSet<>();
+        int nativeFlag = AccessFlags.NATIVE.getValue();
+        for (ClassDef cls : dexFile.getClasses()) {
+            for (Method m : cls.getMethods()) {
+                if ((m.getAccessFlags() & nativeFlag) != 0) {
+                    result.add(cls.getType());
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    // ========== Class FQN string-literal fix ==========
+
+    /**
+     * Build a map of original dotted FQN -> renamed dotted FQN by applying TypeRenamer
+     * to every class type in the DEX. Only entries that were actually renamed are kept.
+     */
+    private static Map<String, String> buildFqnRenameMap(DexBackedDexFile dexFile) {
+        Map<String, String> map = new HashMap<>();
+        for (ClassDef cls : dexFile.getClasses()) {
+            String origType = cls.getType();
+            String renamedType = TypeRenamer.renameType(origType);
+            if (origType.equals(renamedType)) continue;
+            if (origType.length() < 3 || renamedType.length() < 3) continue;
+            String origFqn = origType.substring(1, origType.length() - 1).replace('/', '.');
+            String renamedFqn = renamedType.substring(1, renamedType.length() - 1).replace('/', '.');
+            map.put(origFqn, renamedFqn);
+        }
+        return map;
+    }
+
+    // Matches a quoted dotted identifier of the shape used by class FQN strings.
+    private static final Pattern QUOTED_FQN_PATTERN = Pattern.compile(
+        "\"([a-zA-Z_$][a-zA-Z0-9_$]*(?:\\.[a-zA-Z_$][a-zA-Z0-9_$]*)+)\""
+    );
+
+    private static void fixClassNameStringLiterals(File dir, Map<String, String> fqnMap) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                fixClassNameStringLiterals(file, fqnMap);
+            } else if (file.getName().endsWith(".smali")) {
+                fixClassNameStringLiteralsInFile(file, fqnMap);
+            }
+        }
+    }
+
+    private static void fixClassNameStringLiteralsInFile(File smaliFile, Map<String, String> fqnMap) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+        boolean modified = false;
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            String trimmed = line.trim();
+            // Skip metadata lines that already use unrenamed FQN forms intentionally.
+            if (trimmed.startsWith(".source") || trimmed.startsWith(".class")
+                || trimmed.startsWith(".super") || trimmed.startsWith(".implements")) {
+                continue;
+            }
+            Matcher m = QUOTED_FQN_PATTERN.matcher(line);
+            StringBuilder sb = new StringBuilder();
+            int lastEnd = 0;
+            boolean changed = false;
+            while (m.find()) {
+                String inner = m.group(1);
+                String renamed = fqnMap.get(inner);
+                if (renamed != null) {
+                    sb.append(line, lastEnd, m.start());
+                    sb.append('"').append(renamed).append('"');
+                    lastEnd = m.end();
+                    changed = true;
+                }
+            }
+            if (changed) {
+                sb.append(line, lastEnd, line.length());
+                lines.set(i, sb.toString());
+                modified = true;
+            }
+        }
+        if (modified) {
+            Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
+        }
+    }
+
+    // ========== Hilt @LazyClassKey clinit fix ==========
+
+    private static final Pattern LAZY_MAP_KEY_SOURCE = Pattern.compile(
+        "\\.source\\s+\"(.+?)_HiltModules_(?:BindsModule_Binds|KeyModule_Provide)_LazyMapKey\\.java\""
+    );
+
+    private static final Pattern CLASS_DECL_PATTERN = Pattern.compile(
+        "^\\.class[^L]*L([^;]+);"
+    );
+
+    private static void fixHiltLazyMapKeyClinits(File dir) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                fixHiltLazyMapKeyClinits(file);
+            } else if (file.getName().endsWith(".smali")) {
+                fixHiltLazyMapKeyClinitInFile(file);
+            }
+        }
+    }
+
+    private static void fixHiltLazyMapKeyClinitInFile(File smaliFile) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+
+        String targetSimpleName = null;
+        String thisClassPath = null;
+        for (String line : lines) {
+            String t = line.trim();
+            if (targetSimpleName == null) {
+                Matcher m = LAZY_MAP_KEY_SOURCE.matcher(t);
+                if (m.matches()) {
+                    targetSimpleName = m.group(1);
+                }
+            }
+            if (thisClassPath == null) {
+                Matcher m = CLASS_DECL_PATTERN.matcher(line);
+                if (m.find()) {
+                    thisClassPath = m.group(1);
+                }
+            }
+            if (targetSimpleName != null && thisClassPath != null) break;
+        }
+        if (targetSimpleName == null || thisClassPath == null) return;
+
+        String renamedFqn = findSiblingClassRenamedFqn(smaliFile.getParentFile(), targetSimpleName);
+        if (renamedFqn == null) return;
+
+        // Locate <clinit> method and the field it sets
+        int clinitStart = -1, clinitEnd = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            String t = lines.get(i).trim();
+            if (clinitStart == -1 && t.startsWith(".method") && t.endsWith("<clinit>()V")) {
+                clinitStart = i;
+            } else if (clinitStart != -1 && t.equals(".end method")) {
+                clinitEnd = i;
+                break;
+            }
+        }
+        if (clinitStart == -1 || clinitEnd == -1) return;
+
+        String quotedClass = Pattern.quote(thisClassPath);
+        Pattern sputPattern = Pattern.compile(
+            "sput-object\\s+v\\d+,\\s+L" + quotedClass + ";->(\\w+):Ljava/lang/String;"
+        );
+        String fieldName = null;
+        for (int i = clinitStart; i <= clinitEnd; i++) {
+            Matcher m = sputPattern.matcher(lines.get(i));
+            if (m.find()) {
+                fieldName = m.group(1);
+                break;
+            }
+        }
+        if (fieldName == null) return;
+
+        List<String> rewritten = new ArrayList<>(lines.subList(0, clinitStart));
+        rewritten.add(lines.get(clinitStart));
+        rewritten.add("    .locals 1");
+        rewritten.add("");
+        rewritten.add("    const-string v0, \"" + renamedFqn + "\"");
+        rewritten.add("");
+        rewritten.add("    sput-object v0, L" + thisClassPath + ";->" + fieldName + ":Ljava/lang/String;");
+        rewritten.add("");
+        rewritten.add("    return-void");
+        rewritten.add(".end method");
+        rewritten.addAll(lines.subList(clinitEnd + 1, lines.size()));
+
+        Files.write(smaliFile.toPath(), rewritten, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Search siblings of {@code parentDir} for a smali whose .source matches
+     * "{simpleName}.kt" or "{simpleName}.java" but is NOT itself a Hilt-generated
+     * helper class. Returns the renamed dotted FQN of the first match, or null.
+     */
+    private static String findSiblingClassRenamedFqn(File parentDir, String simpleName) throws IOException {
+        if (parentDir == null) return null;
+        File[] siblings = parentDir.listFiles();
+        if (siblings == null) return null;
+        Pattern sourcePattern = Pattern.compile(
+            "\\.source\\s+\"" + Pattern.quote(simpleName) + "\\.(?:kt|java)\""
+        );
+        for (File sib : siblings) {
+            if (sib.isDirectory() || !sib.getName().endsWith(".smali")) continue;
+            List<String> lines = Files.readAllLines(sib.toPath(), StandardCharsets.UTF_8);
+            String classPath = null;
+            boolean sourceMatch = false;
+            for (String line : lines) {
+                String t = line.trim();
+                if (!sourceMatch && sourcePattern.matcher(t).matches()) {
+                    sourceMatch = true;
+                }
+                if (classPath == null) {
+                    Matcher m = CLASS_DECL_PATTERN.matcher(line);
+                    if (m.find()) classPath = m.group(1);
+                }
+                if (sourceMatch && classPath != null) {
+                    return classPath.replace('/', '.');
+                }
+            }
+        }
+        return null;
     }
 
     // ========== InnerClass annotation fix ==========
