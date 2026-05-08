@@ -206,6 +206,16 @@ public class SmaliDecoder {
         } catch (IOException ignored) {
         }
 
+        // Strip ALL .line directives from any smali file that contains at least one
+        // line number larger than the JVM class-file spec limit (u2, 65535). Such a
+        // value can never come from real source and indicates R8 line obfuscation
+        // or corrupted debug info; mixing valid + invalid line numbers in stack
+        // traces is more confusing than dropping them entirely.
+        try {
+            stripSuspiciousLineDirectives(smaliDir);
+        } catch (IOException ignored) {
+        }
+
         int apiLevel = dexFile.getOpcodes().api;
         mInferredApiLevel.updateAndGet(cur -> (cur == 0 || cur > apiLevel) ? apiLevel : cur);
     }
@@ -336,6 +346,57 @@ public class SmaliDecoder {
         if (modified) {
             Files.write(smaliFile.toPath(), lines, StandardCharsets.UTF_8);
         }
+    }
+
+    // ========== Suspicious .line directive strip ==========
+
+    private static final Pattern LINE_DIRECTIVE_PATTERN = Pattern.compile(
+        "^\\s*\\.line\\s+(\\d+)\\s*$"
+    );
+
+    /** JVM spec: LineNumberTable line_number is u2. Anything above is invalid. */
+    private static final int MAX_VALID_LINE_NUMBER = 65535;
+
+    private static void stripSuspiciousLineDirectives(File dir) throws IOException {
+        File[] files = dir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            if (file.isDirectory()) {
+                stripSuspiciousLineDirectives(file);
+            } else if (file.getName().endsWith(".smali")) {
+                stripSuspiciousLineDirectivesInFile(file);
+            }
+        }
+    }
+
+    private static void stripSuspiciousLineDirectivesInFile(File smaliFile) throws IOException {
+        List<String> lines = Files.readAllLines(smaliFile.toPath(), StandardCharsets.UTF_8);
+
+        boolean hasSuspicious = false;
+        for (String line : lines) {
+            Matcher m = LINE_DIRECTIVE_PATTERN.matcher(line);
+            if (m.matches()) {
+                long n;
+                try {
+                    n = Long.parseLong(m.group(1));
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
+                if (n > MAX_VALID_LINE_NUMBER) {
+                    hasSuspicious = true;
+                    break;
+                }
+            }
+        }
+        if (!hasSuspicious) return;
+
+        List<String> filtered = new ArrayList<>(lines.size());
+        for (String line : lines) {
+            if (!LINE_DIRECTIVE_PATTERN.matcher(line).matches()) {
+                filtered.add(line);
+            }
+        }
+        Files.write(smaliFile.toPath(), filtered, StandardCharsets.UTF_8);
     }
 
     // ========== Native-method class detection ==========
